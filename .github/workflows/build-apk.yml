@@ -1,1 +1,213 @@
-.....
+# Place this file at: .github/workflows/build-apk.yml
+#
+# What it does:
+#  1. Finds the NEWEST .zip in the repo (by last commit that added/modified it)
+#     that actually contains a Gradle project. Invalid / unrelated zips are skipped.
+#  2. Extracts it ONLY inside the build machine (the zip in your repo is never touched or changed).
+#  3. Builds debug + release APKs, uploads them as artifacts and as the "latest-apk" Release.
+name: Build APK
+
+on:
+  push:
+    paths:
+      - '**.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Optional: exact zip path to build (empty = newest zip)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # needed only for publishing the "latest-apk" release
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PUBLISH_RELEASE: 'true'   # set to 'false' to skip the Release page and only use Artifacts
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout (full history to detect the newest zip)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick newest project zip and extract it
+        id: pick
+        shell: bash
+        env:
+          ZIP_OVERRIDE: ${{ inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          WORK="$GITHUB_WORKSPACE/.zip-build"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          CANDIDATES="$RUNNER_TEMP/zip-candidates.txt"
+          : > "$CANDIDATES"
+
+          if [ -n "${ZIP_OVERRIDE:-}" ]; then
+            [ -f "$ZIP_OVERRIDE" ] || { echo "::error::zip_path '$ZIP_OVERRIDE' not found in repo"; exit 1; }
+            printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$ZIP_OVERRIDE")" "$ZIP_OVERRIDE" > "$CANDIDATES"
+          else
+            # every tracked zip + the time of the last commit that touched it, newest first
+            git ls-files -z | while IFS= read -r -d '' f; do
+              case "${f,,}" in
+                *.zip) printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f")" "$f" ;;
+              esac
+            done | sort -t "$(printf '\t')" -k1,1nr -k2,2 > "$CANDIDATES"
+          fi
+
+          echo "Zip files found (newest first):"
+          cat "$CANDIDATES" || true
+
+          FOUND=""
+          while IFS="$(printf '\t')" read -r ts zip; do
+            [ -n "$zip" ] || continue
+            echo "Checking: $zip"
+            if ! unzip -tqq "$zip" >/dev/null 2>&1; then echo "  -> not a valid zip, skipping"; continue; fi
+            LIST="$(unzip -Z1 "$zip" || true)"
+            if ! grep -v '^__MACOSX/' <<< "$LIST" | grep -Eq '(^|/)settings\.gradle(\.kts)?$'; then
+              echo "  -> no Gradle project inside, skipping"; continue
+            fi
+            FOUND="$zip"; break
+          done < "$CANDIDATES"
+
+          [ -n "$FOUND" ] || { echo "::error::No .zip containing a Gradle Android project was found in the repo."; exit 1; }
+          echo "Using zip: $FOUND"
+
+          unzip -q -o "$FOUND" -d "$WORK" -x '__MACOSX/*' '*.DS_Store'
+
+          SETTINGS="$(find "$WORK" -maxdepth 4 -type f \( -name settings.gradle.kts -o -name settings.gradle \) \
+            | awk '{ print gsub("/","/") "\t" $0 }' | sort -n | sed -n '1p' | cut -f2-)"
+          [ -n "$SETTINGS" ] || { echo "::error::settings.gradle(.kts) not found after extraction"; exit 1; }
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          echo "Project root: $PROJECT_DIR"
+
+          cd "$PROJECT_DIR"
+          USE_WRAPPER=false
+          GRADLE_VERSION=8.9
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            USE_WRAPPER=true
+            GRADLE_VERSION=wrapper
+            chmod +x gradlew
+          elif [ -f gradle/wrapper/gradle-wrapper.properties ]; then
+            V="$(sed -n 's/.*gradle-\([0-9][0-9.]*\)-\(bin\|all\)\.zip.*/\1/p' gradle/wrapper/gradle-wrapper.properties | sed -n '1p')"
+            if [ -n "$V" ]; then GRADLE_VERSION="$V"; fi
+          fi
+
+          NAME="$(printf '%s' "$(basename "$FOUND" .zip)" | tr -c 'A-Za-z0-9._-' '_')"
+          {
+            echo "project_dir=$PROJECT_DIR"
+            echo "zip=$FOUND"
+            echo "name=$NAME"
+            echo "use_wrapper=$USE_WRAPPER"
+            echo "gradle_version=$GRADLE_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.pick.outputs.gradle_version }}
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: yes | "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        shell: bash
+        working-directory: ${{ steps.pick.outputs.project_dir }}
+        env:
+          USE_WRAPPER: ${{ steps.pick.outputs.use_wrapper }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_WRAPPER" = "true" ]; then G=./gradlew; else G=gradle; fi
+          $G assembleDebug --stacktrace --no-daemon
+
+      - name: Decode release keystore (only if secrets exist)
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+            echo "Custom keystore decoded."
+          fi
+
+      - name: Build release APK
+        continue-on-error: true   # debug APK is still delivered if release fails
+        shell: bash
+        working-directory: ${{ steps.pick.outputs.project_dir }}
+        env:
+          USE_WRAPPER: ${{ steps.pick.outputs.use_wrapper }}
+          KEYSTORE_PATH: ${{ runner.temp }}/release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_WRAPPER" = "true" ]; then G=./gradlew; else G=gradle; fi
+          $G assembleRelease --stacktrace --no-daemon
+
+      - name: Collect APKs
+        id: collect
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.pick.outputs.project_dir }}
+          NAME: ${{ steps.pick.outputs.name }}
+          ZIP: ${{ steps.pick.outputs.zip }}
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/_out"
+          mkdir -p "$OUT"
+          find "$PROJECT_DIR" -type f -name '*.apk' -path '*/build/outputs/apk/*' ! -name '*unsigned*' -print0 |
+            while IFS= read -r -d '' f; do cp "$f" "$OUT/${NAME}-$(basename "$f")"; done
+          ls -la "$OUT"
+          [ -n "$(ls -A "$OUT")" ] || { echo "::error::No APK produced"; exit 1; }
+          {
+            echo "### APK build finished"
+            echo "- Source zip: \`$ZIP\` (left untouched in the repo)"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo; echo '| File | Size |'; echo '|---|---|'
+            for f in "$OUT"/*.apk; do echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-debug
+          path: _out/*debug*.apk
+          if-no-files-found: error
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-release
+          path: _out/*release*.apk
+          if-no-files-found: warn
+
+      - name: Publish "latest-apk" release
+        if: env.PUBLISH_RELEASE == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.pick.outputs.name }}
+          ZIP: ${{ steps.pick.outputs.zip }}
+        run: |
+          set -euo pipefail
+          TAG=latest-apk
+          gh release delete "$TAG" --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create "$TAG" _out/*.apk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Latest APK - $NAME" \
+            --notes "Built from \`$ZIP\` at commit $GITHUB_SHA. Install the *release* APK (smaller) or the *debug* APK."
